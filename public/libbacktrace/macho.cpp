@@ -856,6 +856,65 @@ macho_add_fat (struct backtrace_state *state, const char *filename,
   return 0;
 }
 
+static int exectobuffer(const char *cmd, char *buff, int buffsize)
+{
+    FILE *fp = popen(cmd, "r");
+    if(fp == NULL)
+      return 0;
+
+	int overflow = 0;
+	char *target = buff;
+	int remaining = buffsize-1;
+    while(!feof(fp) && !overflow)
+    {
+		char b[255];
+		int size = (int)fread(b, 1, 255, fp);
+		if(size == 0)
+			continue;
+
+		overflow = remaining <= size;
+		int copysize = overflow ? remaining : size;
+		memcpy(target, b, copysize);
+		target += copysize;
+		remaining -= copysize;
+    }
+
+	buff[buffsize-remaining] = '\0';
+	pclose(fp);
+	return !overflow;
+}
+
+static int macho_find_dsym_by_uuid(char *path, int pathsize,
+    const unsigned char *uuid)
+{
+    char cmd[512];
+    memset(cmd, 0, sizeof(cmd));
+    snprintf(cmd, sizeof(cmd), "/usr/bin/mdfind 'com_apple_xcode_dsym_uuids==%X%X%X%X-%X%X-%X%X-%X%X-%X%X%X%X%X%X'",
+      uuid[0], uuid[1], uuid[2],  uuid[3],
+      uuid[4], uuid[5], uuid[6],  uuid[7],
+      uuid[8], uuid[9], uuid[10],  uuid[11],
+      uuid[12], uuid[13], uuid[14],  uuid[15]
+    );
+
+  printf(">> Looking up dsym: %s\n", cmd);
+	if(!exectobuffer(cmd, path, pathsize))
+		return 0;
+
+	// Terminate at first newline
+	int foundline = 0;
+	char *p = path;
+	while(*p && !foundline)
+	{
+		foundline = (*p == '\n');
+		if(foundline)
+			*p = '\0';
+		++p;
+	}
+	return foundline;
+}
+
+
+
 /* Look for the dsym file for FILENAME.  This is called if FILENAME
    does not have debug info or a symbol table.  Returns 1 on success,
    0 on failure.  */
@@ -939,9 +998,36 @@ macho_add_dsym (struct backtrace_state *state, const char *filename,
       diralc = NULL;
     }
 
+  printf(">> Openning Sym: %s\n", dsym);
   d = backtrace_open (dsym, error_callback, data, &does_not_exist);
+
+  /* Try searching by uuid */
+  if (d < 0)
+  {
+    char s[1024];
+    memset(s, 0, sizeof(s));
+    d = macho_find_dsym_by_uuid(s, sizeof(s), uuid);
+    if(d == 1)
+    {
+        printf(">> Openning Found Sym: %s\n", dsym);
+        backtrace_free (state, dsym, dsymlen, error_callback, data);
+        int len = strlen(s);
+        const char *suffixdir = "/Contents/Resources/DWARF/";
+        int suffixdirlen = strlen (suffixdir);
+        dsymlen = len+suffixdirlen+basenamelen+1;
+        dsym = (char*)backtrace_alloc (state, dsymlen, error_callback, data);
+        memcpy (dsym, s, len);
+        memcpy (dsym+len, suffixdir, suffixdirlen);
+        memcpy (dsym+len+suffixdirlen, basename, suffixdirlen);
+        dsym[len+suffixdirlen+basenamelen] = '\0';
+        printf(">> Openning Found Sym2: %s\n", dsym);
+        d = backtrace_open (dsym, error_callback, data, &does_not_exist);
+    }
+  }
+
   if (d < 0)
     {
+      printf(">> Failed\n");
       /* The file does not exist, so we can't read the debug info.
 	 Just return success.  */
       backtrace_free (state, dsym, dsymlen, error_callback, data);
